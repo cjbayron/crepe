@@ -87,7 +87,7 @@ crepe = (function() {
 
   // perform resampling the audio to 16000 Hz, on which the model is trained.
   // setting a sample rate in AudioContext is not supported by most browsers at the moment.
-  function resample(audioBuffer, onComplete) {
+  function resample(audioBuffer) {
     const interpolate = (audioBuffer.sampleRate % 16000 != 0);
     const multiplier = audioBuffer.sampleRate / 16000;
     const original = audioBuffer.getChannelData(0);
@@ -103,53 +103,83 @@ crepe = (function() {
         subsamples[i] = (1 - p) * original[left] + p * original[right];
       }
     }
-    onComplete(subsamples);
+    return subsamples;
   }
 
   // bin number -> cent value mapping
   const cent_mapping = tf.add(tf.linspace(0, 7180, 360), tf.tensor(1997.3794084376191))
 
-  function process_microphone_buffer(event) {
-    resample(event.inputBuffer, function(resampled) {
-      tf.tidy(() => {
-        running = true;
+  function transcribe(resampled) {
+    tf.tidy(() => {
+      running = true;
 
-        // run the prediction on the model
-        const frame = tf.tensor(resampled.slice(0, 1024));
-        const zeromean = tf.sub(frame, tf.mean(frame));
-        const framestd = tf.tensor(tf.norm(zeromean).dataSync()/Math.sqrt(1024));
-        const normalized = tf.div(zeromean, framestd);
-        const input = normalized.reshape([1, 1024]);
-        const activation = model.predict([input]).reshape([360]);
+      // run the prediction on the model
+      const frame = tf.tensor(resampled.slice(0, 1024));
+      const zeromean = tf.sub(frame, tf.mean(frame));
+      const framestd = tf.tensor(tf.norm(zeromean).dataSync()/Math.sqrt(1024));
+      const normalized = tf.div(zeromean, framestd);
+      const input = normalized.reshape([1, 1024]);
+      const activation = model.predict([input]).reshape([360]);
 
-        // the confidence of voicing activity and the argmax bin
-        const confidence = activation.max().dataSync()[0];
-        const center = activation.argMax().dataSync()[0];
-        document.getElementById('voicing-confidence').innerHTML = confidence.toFixed(3);
+      // the confidence of voicing activity and the argmax bin
+      const confidence = activation.max().dataSync()[0];
+      const center = activation.argMax().dataSync()[0];
+      document.getElementById('voicing-confidence').innerHTML = confidence.toFixed(3);
 
-        // slice the local neighborhood around the argmax bin
-        const start = Math.max(0, center - 4);
-        const end = Math.min(360, center + 5);
-        const weights = activation.slice([start], [end - start]);
-        const cents = cent_mapping.slice([start], [end - start]);
+      // slice the local neighborhood around the argmax bin
+      const start = Math.max(0, center - 4);
+      const end = Math.min(360, center + 5);
+      const weights = activation.slice([start], [end - start]);
+      const cents = cent_mapping.slice([start], [end - start]);
 
-        // take the local weighted average to get the predicted pitch
-        const products = tf.mul(weights, cents);
-        const productSum = products.dataSync().reduce((a, b) => a + b, 0);
-        const weightSum = weights.dataSync().reduce((a, b) => a + b, 0);
-        const predicted_cent = productSum / weightSum;
-        const predicted_hz = 10 * Math.pow(2, predicted_cent / 1200.0);
-        const predicted_pitch = Tonal.Note.fromFreq(predicted_hz);
+      // take the local weighted average to get the predicted pitch
+      const products = tf.mul(weights, cents);
+      const productSum = products.dataSync().reduce((a, b) => a + b, 0);
+      const weightSum = weights.dataSync().reduce((a, b) => a + b, 0);
+      const predicted_cent = productSum / weightSum;
+      const predicted_hz = 10 * Math.pow(2, predicted_cent / 1200.0);
+      const predicted_pitch = Tonal.Note.fromFreq(predicted_hz);
 
-        // update the UI and the activation plot
-        var result = (confidence > 0.5) ? predicted_hz.toFixed(3) + ' Hz' : '&nbsp;no voice&nbsp&nbsp;';
-        var strlen = result.length;
-        for (var i = 0; i < 11 - strlen; i++) result = "&nbsp;" + result;
-        document.getElementById('estimated-pitch').innerHTML = result;
-        document.getElementById('pitch-name').innerHTML = predicted_pitch;
-        updateActivation(activation.dataSync());
-      });
+      // update the UI and the activation plot
+      var result = (confidence > 0.5) ? predicted_hz.toFixed(3) + ' Hz' : '&nbsp;no voice&nbsp&nbsp;';
+      var strlen = result.length;
+      for (var i = 0; i < 11 - strlen; i++) result = "&nbsp;" + result;
+      document.getElementById('estimated-pitch').innerHTML = result;
+      document.getElementById('pitch-name').innerHTML = predicted_pitch;
+      updateActivation(activation.dataSync());
     });
+  }
+
+  let savedSamples = [];
+  let hopRatio = 1.0;
+  function Float32Concat(first, second)
+  {
+      var firstLength = first.length,
+          result = new Float32Array(firstLength + second.length);
+
+      result.set(first);
+      result.set(second, firstLength);
+
+      return result;
+  }
+
+  function process_microphone_buffer(event) {
+    resampled = resample(event.inputBuffer);
+    //console.log(resampled.length)
+
+    if (savedSamples.length > 0) {
+      const targetFrameLength = resampled.length;
+      const concatLength = targetFrameLength - savedSamples.length;
+      let frame = Float32Concat(savedSamples, resampled.slice(0, concatLength));
+      transcribe(frame);
+    }
+
+    transcribe(resampled);
+
+    if (hopRatio < 1.0) {
+      const n_samps_to_save = Math.floor((1 - hopRatio) * resampled.length)
+      savedSamples = resampled.slice(resampled.length - n_samps_to_save, resampled.length);
+    }
   }
 
   function initAudio() {
